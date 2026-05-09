@@ -50,7 +50,6 @@ section[data-testid="stSidebar"] .stSelectbox > div > div {
     color: #fff !important;
     border: 1px solid rgba(255,255,255,0.3) !important;
 }
-
 .main-title {
     font-size: 2.8rem; font-weight: 900;
     background: linear-gradient(90deg,#1e3a5f,#7c3aed,#be185d);
@@ -122,7 +121,7 @@ section[data-testid="stSidebar"] .stSelectbox > div > div {
 .rec-card .r-return { color: #7c3aed; font-size: 1.8rem; font-weight: 900; }
 .rec-card .r-price  { color: #64748b; font-size: 0.8rem; margin-top: 4px; font-weight: 600; }
 
-h1,h2,h3  { color: #1e3a5f !important; }
+h1,h2,h3 { color: #1e3a5f !important; }
 p, label, .stMarkdown p { color: #334155 !important; }
 div[data-testid="stMetricValue"] { color: #1e3a5f !important; }
 </style>
@@ -180,14 +179,14 @@ def load_data():
                 continue
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            # Keep only needed columns that exist
-            cols = [c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
+            cols = [c for c in ['Open','High','Low','Close','Volume']
+                    if c in df.columns]
             df = df[cols].copy()
             df.dropna(subset=['Close'], inplace=True)
             if len(df) > 60:
                 data[t] = df
-        except Exception as e:
-            pass   # skip failed tickers silently
+        except Exception:
+            pass
     return data
 
 # ── Feature engineering ───────────────────────────────────────────────────────
@@ -290,24 +289,70 @@ def train_models(_data):
 
     return df_proc, per_models, results
 
-# ── Signal helper ─────────────────────────────────────────────────────────────
+# ── Signal helper (FIXED — balanced thresholds) ───────────────────────────────
 def get_signal(ticker, model_name, df_processed, per_models):
+    """
+    Returns 'buy', 'sell', or 'hold' based on predicted return.
+    Uses ±1% threshold for a balanced distribution of signals.
+    """
     try:
         sd = df_processed[df_processed['Ticker'] == ticker]
         if len(sd) == 0:
             return "hold"
+
+        # Try the selected model first, fall back to the other one
         m = per_models.get(model_name, {}).get(ticker)
         if m is None:
+            other = "Random Forest" if model_name == "XGBoost" else "XGBoost"
+            m = per_models.get(other, {}).get(ticker)
+        if m is None:
             return "hold"
-        pp  = m.predict(sd[FEATURES].iloc[-1:].values)[0]
-        lc  = sd['Close'].iloc[-1]
+
+        latest = sd[FEATURES].iloc[-1:]
+        if latest.isnull().any().any():
+            return "hold"
+
+        pp  = float(m.predict(latest.values)[0])
+        lc  = float(sd['Close'].iloc[-1])
+        if lc == 0:
+            return "hold"
+
         ret = ((pp - lc) / lc) * 100
-        return "buy" if ret > 0.5 else ("sell" if ret < -0.5 else "hold")
+
+        # ±1% gives a realistic spread of buy/hold/sell
+        if ret > 1.0:
+            return "buy"
+        elif ret < -1.0:
+            return "sell"
+        else:
+            return "hold"
     except Exception:
         return "hold"
 
+# ── Predicted return helper ───────────────────────────────────────────────────
+def get_predicted_return(ticker, model_name, df_processed, per_models):
+    """Returns the raw predicted % return for a ticker."""
+    try:
+        sd = df_processed[df_processed['Ticker'] == ticker]
+        if len(sd) == 0:
+            return 0.0
+        m = per_models.get(model_name, {}).get(ticker)
+        if m is None:
+            return 0.0
+        latest = sd[FEATURES].iloc[-1:]
+        if latest.isnull().any().any():
+            return 0.0
+        pp  = float(m.predict(latest.values)[0])
+        lc  = float(sd['Close'].iloc[-1])
+        if lc == 0:
+            return 0.0
+        return round(((pp - lc) / lc) * 100, 2)
+    except Exception:
+        return 0.0
+
 # ── Recommendation engine ─────────────────────────────────────────────────────
-def recommend_stocks(watchlist, model_name, data, df_processed, per_models, top_n=5):
+def recommend_stocks(watchlist, model_name, data, df_processed,
+                     per_models, top_n=5):
     recs = []
     for ticker in data.keys():
         if ticker in watchlist:
@@ -319,14 +364,19 @@ def recommend_stocks(watchlist, model_name, data, df_processed, per_models, top_
             m = per_models.get(model_name, {}).get(ticker)
             if m is None:
                 continue
-            pp  = m.predict(sd[FEATURES].iloc[-1:].values)[0]
-            lc  = sd['Close'].iloc[-1]
-            ret = ((pp - lc) / lc) * 100
-            rsi       = sd['RSI'].iloc[-1]
+            latest = sd[FEATURES].iloc[-1:]
+            if latest.isnull().any().any():
+                continue
+            pp  = float(m.predict(latest.values)[0])
+            lc  = float(sd['Close'].iloc[-1])
+            if lc == 0:
+                continue
+            ret       = ((pp - lc) / lc) * 100
+            rsi       = float(sd['RSI'].iloc[-1])
             rsi_score = 1.0 if rsi < 40 else (-1.0 if rsi > 60 else 0.0)
             vol       = sd['Close'].pct_change().std()
             vol       = 0.0 if pd.isna(vol) else float(vol)
-            signal    = "Buy" if ret > 0.5 else ("Sell" if ret < -0.5 else "Hold")
+            signal    = "Buy" if ret > 1.0 else ("Sell" if ret < -1.0 else "Hold")
             score     = ret * 0.6 + rsi_score * 0.3 - vol * 0.1
             recs.append({
                 "ticker":           ticker,
@@ -363,7 +413,6 @@ with st.sidebar:
     st.markdown("## ⚙️ Settings")
     st.markdown("---")
 
-    # Only show tickers that loaded successfully
     available_tickers = [t for t in TICKERS if t in data]
 
     if not available_tickers:
@@ -400,19 +449,20 @@ st.markdown(
     ' for Top Pakistan Stock Exchange Companies</div>',
     unsafe_allow_html=True)
 
-# ── Stats bar ─────────────────────────────────────────────────────────────────
-buy_c  = sum(1 for t in data
-             if get_signal(t, selected_model, df_processed, per_models) == "buy")
-sell_c = sum(1 for t in data
-             if get_signal(t, selected_model, df_processed, per_models) == "sell")
-hold_c = len(data) - buy_c - sell_c
+# ── Stats bar (FIXED — signals computed after models are loaded) ───────────────
+signals = {t: get_signal(t, selected_model, df_processed, per_models)
+           for t in data.keys()}
+
+buy_c  = sum(1 for s in signals.values() if s == "buy")
+sell_c = sum(1 for s in signals.values() if s == "sell")
+hold_c = sum(1 for s in signals.values() if s == "hold")
 best   = max(results, key=lambda x: results[x]['Acc']) if results else "XGBoost"
+best_acc = results.get(best, {}).get('Acc', '—')
 
 s_cols = st.columns(5)
 for col, num, lbl in zip(
     s_cols,
-    [len(data), buy_c, sell_c, hold_c,
-     f"{results.get(best,{}).get('Acc','—')}%"],
+    [len(data), buy_c, sell_c, hold_c, f"{best_acc}%"],
     ["🏢 Companies","🟢 Buy Signals","🔴 Sell Signals",
      "🟡 Hold Signals","⭐ Best Accuracy"]
 ):
@@ -425,7 +475,7 @@ for col, num, lbl in zip(
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Company cards ─────────────────────────────────────────────────────────────
+# ── Company cards (FIXED — shows real signal per ticker) ──────────────────────
 st.markdown('<div class="sec-hdr">🏢 PSX Companies — Live Snapshot</div>',
             unsafe_allow_html=True)
 
@@ -438,15 +488,26 @@ for i, tick in enumerate(available_tickers):
                 lc    = float(sd['Close'].iloc[-1])
                 rsi   = float(sd['RSI'].iloc[-1])
                 ret1d = float(sd['Return_1d'].iloc[-1])
-                sig   = "buy" if rsi < 40 else ("sell" if rsi > 60 else "hold")
+
+                # Use AI predicted signal (not just RSI)
+                sig   = signals.get(tick, "hold")
                 arrow = "▲" if ret1d > 0 else "▼"
                 clr   = "#15803d" if ret1d > 0 else "#dc2626"
+
+                # Show predicted return too
+                pred_ret = get_predicted_return(
+                    tick, selected_model, df_processed, per_models)
+
                 st.markdown(f"""
                 <div class='ccard'>
                     <div class='c-name'>{TICKER_NAMES.get(tick, tick)}</div>
                     <div class='c-price'>PKR {lc:,.0f}</div>
                     <div class='c-chg' style='color:{clr}'>
                         {arrow} {abs(ret1d):.2f}%
+                    </div>
+                    <div style='color:#7c3aed;font-size:0.72rem;
+                         font-weight:700;margin-top:3px;'>
+                        AI: {pred_ret:+.2f}%
                     </div>
                     <div style='margin-top:5px'>
                         <span class='b-{sig}'>{sig.upper()}</span>
@@ -460,7 +521,6 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ── Price chart ───────────────────────────────────────────────────────────────
 left, right = st.columns([2, 1])
 
-# Safe guard — make sure selected stock is available
 if selected_stock not in data:
     st.warning(f"⚠️ Data not available for "
                f"{TICKER_NAMES.get(selected_stock, selected_stock)}. "
@@ -477,13 +537,13 @@ with left:
         unsafe_allow_html=True)
 
     chart_type = st.radio("", ["Line", "Candlestick"], horizontal=True)
-
     fig = go.Figure()
+
     if chart_type == "Candlestick" and all(
             c in raw.columns for c in ['Open','High','Low','Close']):
         fig.add_trace(go.Candlestick(
             x=raw.index, open=raw['Open'], high=raw['High'],
-            low=raw['Low'],  close=raw['Close'],
+            low=raw['Low'], close=raw['Close'],
             increasing_line_color='#15803d',
             decreasing_line_color='#dc2626'))
     else:
@@ -545,41 +605,47 @@ with right:
         value=rsi_now,
         number={'font': {'color': '#1e3a5f', 'size': 36}},
         gauge={
-            'axis':       {'range': [0, 100], 'tickcolor': '#64748b',
-                           'tickfont': {'color': '#64748b'}},
+            'axis':       {'range': [0,100], 'tickcolor':'#64748b',
+                           'tickfont': {'color':'#64748b'}},
             'bar':        {'color': gc, 'thickness': 0.28},
             'bgcolor':    'rgba(255,255,255,0.9)',
             'bordercolor':'rgba(30,58,95,0.1)',
             'steps': [
-                {'range': [0,  30],  'color': 'rgba(21,128,61,0.12)'},
-                {'range': [30, 70],  'color': 'rgba(217,119,6,0.07)'},
-                {'range': [70, 100], 'color': 'rgba(220,38,38,0.12)'},
+                {'range':[0,  30],  'color':'rgba(21,128,61,0.12)'},
+                {'range':[30, 70],  'color':'rgba(217,119,6,0.07)'},
+                {'range':[70, 100], 'color':'rgba(220,38,38,0.12)'},
             ],
         },
-        title={'text': "RSI Index", 'font': {'color': '#475569', 'size': 14}}
+        title={'text':"RSI Index", 'font':{'color':'#475569','size':14}}
     ))
     fig_g.update_layout(
         paper_bgcolor=PAPER_BG, font_color=FONT_CLR,
-        height=240, margin=dict(l=10, r=10, t=40, b=10))
+        height=240, margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig_g, use_container_width=True)
 
     # Key stats
     st.markdown('<div class="sec-hdr">📌 Key Stats</div>',
                 unsafe_allow_html=True)
     try:
-        lc    = float(sd['Close'].iloc[-1])
+        lc     = float(sd['Close'].iloc[-1])
         raw_1y = raw.tail(252)
-        hi52  = float(raw_1y['High'].max()) if 'High' in raw_1y else 0
-        lo52  = float(raw_1y['Low'].min())  if 'Low'  in raw_1y else 0
-        macd  = float(sd['MACD'].iloc[-1])
-        vol20 = float(sd['Volatility'].iloc[-1])
+        hi52   = float(raw_1y['High'].max()) if 'High' in raw_1y else 0
+        lo52   = float(raw_1y['Low'].min())  if 'Low'  in raw_1y else 0
+        macd   = float(sd['MACD'].iloc[-1])
+        vol20  = float(sd['Volatility'].iloc[-1])
+        pred_r = get_predicted_return(
+            selected_stock, selected_model, df_processed, per_models)
+        ai_sig = signals.get(selected_stock, "hold").upper()
+
         stats = [
-            ("Last Close",  f"PKR {lc:,.0f}"),
-            ("52W High",    f"PKR {hi52:,.0f}"),
-            ("52W Low",     f"PKR {lo52:,.0f}"),
-            ("MACD",        f"{macd:.2f}"),
-            ("Volatility",  f"{vol20:.2f}%"),
-            ("Sector",      TICKER_SECTORS.get(selected_stock, '')),
+            ("Last Close",    f"PKR {lc:,.0f}"),
+            ("AI Prediction", f"{pred_r:+.2f}%"),
+            ("AI Signal",     ai_sig),
+            ("52W High",      f"PKR {hi52:,.0f}"),
+            ("52W Low",       f"PKR {lo52:,.0f}"),
+            ("MACD",          f"{macd:.2f}"),
+            ("Volatility",    f"{vol20:.2f}%"),
+            ("Sector",        TICKER_SECTORS.get(selected_stock,'')),
         ]
         gc1, gc2 = st.columns(2)
         for j, (lb, vl) in enumerate(stats):
@@ -598,11 +664,14 @@ st.markdown("<br>", unsafe_allow_html=True)
 st.markdown('<div class="sec-hdr">🤖 AI Model Performance Comparison</div>',
             unsafe_allow_html=True)
 
-rf_res  = results.get("Random Forest", {"Acc": 0, "MAE": 0})
-xgb_res = results.get("XGBoost",       {"Acc": 0, "MAE": 0})
-winner  = ("XGBoost" if xgb_res.get('Acc', 0) >= rf_res.get('Acc', 0)
+rf_res  = results.get("Random Forest", {"Acc":0,"MAE":0,"per_stock":{}})
+xgb_res = results.get("XGBoost",       {"Acc":0,"MAE":0,"per_stock":{}})
+winner  = ("XGBoost" if xgb_res.get('Acc',0) >= rf_res.get('Acc',0)
            else "Random Forest")
 loser   = "Random Forest" if winner == "XGBoost" else "XGBoost"
+
+w_acc = results.get(winner,{}).get('Acc',0)
+l_acc = results.get(loser, {}).get('Acc',0)
 
 # Winner banner
 st.markdown(f"""
@@ -616,18 +685,17 @@ st.markdown(f"""
          🏆 Best Performing Model</div>
     <div style='color:#fff;font-size:1.6rem;font-weight:900;'>{winner}</div>
     <div style='color:rgba(255,255,255,0.7);font-size:0.85rem;margin-top:2px;'>
-      Accuracy: <b style='color:#a5f3fc'>{results.get(winner,{}).get('Acc','—')}%</b>
+      Accuracy: <b style='color:#a5f3fc'>{w_acc}%</b>
       &nbsp;|&nbsp;
       MAE: <b style='color:#a5f3fc'>
         PKR {results.get(winner,{}).get('MAE',0):.0f}</b>
     </div>
   </div>
   <div style='text-align:right'>
-    <div style='color:rgba(255,255,255,0.5);font-size:0.75rem;
-         margin-bottom:4px;'>vs {loser}</div>
+    <div style='color:rgba(255,255,255,0.5);font-size:0.75rem;margin-bottom:4px;'>
+        vs {loser}</div>
     <div style='color:#fde68a;font-size:1.2rem;font-weight:800;'>
-      +{abs(results.get(winner,{}).get('Acc',0)
-           - results.get(loser,{}).get('Acc',0)):.1f}% better
+      +{abs(w_acc - l_acc):.1f}% better
     </div>
     <div style='color:rgba(255,255,255,0.5);font-size:0.75rem;'>
         accuracy advantage</div>
@@ -637,10 +705,14 @@ st.markdown(f"""
 # 4 metric cards
 mc = st.columns(4)
 metrics_list = [
-    ("Random Forest", "Accuracy",        f"{rf_res.get('Acc','—')}%",         "Higher is better"),
-    ("Random Forest", "MAE (Avg Error)", f"PKR {rf_res.get('MAE',0):.0f}",    "Lower is better"),
-    ("XGBoost",       "Accuracy",        f"{xgb_res.get('Acc','—')}%",        "Higher is better"),
-    ("XGBoost",       "MAE (Avg Error)", f"PKR {xgb_res.get('MAE',0):.0f}",   "Lower is better"),
+    ("Random Forest","Accuracy",
+     f"{rf_res.get('Acc','—')}%",        "Higher is better"),
+    ("Random Forest","MAE (Avg Error)",
+     f"PKR {rf_res.get('MAE',0):.0f}",   "Lower is better"),
+    ("XGBoost",      "Accuracy",
+     f"{xgb_res.get('Acc','—')}%",       "Higher is better"),
+    ("XGBoost",      "MAE (Avg Error)",
+     f"PKR {xgb_res.get('MAE',0):.0f}",  "Lower is better"),
 ]
 for i, (mname, lbl, val, hint) in enumerate(metrics_list):
     bdr = "border:2px solid #a5f3fc;" if mname == winner else ""
@@ -653,16 +725,58 @@ for i, (mname, lbl, val, hint) in enumerate(metrics_list):
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# Accuracy bar charts
-st.markdown('<div class="sec-hdr">📊 Head-to-Head Accuracy Chart</div>',
+# Per-stock accuracy chart
+st.markdown('<div class="sec-hdr">📋 Per-Company Accuracy — RF vs XGBoost</div>',
+            unsafe_allow_html=True)
+
+rf_ps   = rf_res.get('per_stock',  {})
+xgb_ps  = xgb_res.get('per_stock', {})
+all_t   = sorted(set(list(rf_ps.keys()) + list(xgb_ps.keys())))
+names_ps = [TICKER_NAMES.get(t, t) for t in all_t]
+
+fig_per = go.Figure()
+fig_per.add_trace(go.Bar(
+    name='Random Forest', x=names_ps,
+    y=[rf_ps.get(t, 0) for t in all_t],
+    marker_color='#7c3aed', opacity=0.85,
+    text=[f"{rf_ps.get(t,0):.1f}%" for t in all_t],
+    textposition='outside', textfont=dict(size=10, color='#1e3a5f')))
+fig_per.add_trace(go.Bar(
+    name='XGBoost', x=names_ps,
+    y=[xgb_ps.get(t, 0) for t in all_t],
+    marker_color='#0891b2', opacity=0.85,
+    text=[f"{xgb_ps.get(t,0):.1f}%" for t in all_t],
+    textposition='outside', textfont=dict(size=10, color='#1e3a5f')))
+fig_per.add_hline(
+    y=90, line_dash="dash", line_color="#dc2626", line_width=1.5,
+    annotation_text="Target: 90%",
+    annotation_font_color="#dc2626", annotation_font_size=11)
+fig_per.update_layout(
+    paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
+    font_color=FONT_CLR, height=360, barmode='group',
+    title=dict(text="Accuracy per Company — Random Forest vs XGBoost",
+               font_color='#1e3a5f', font_size=13),
+    yaxis=dict(range=[0,115], showgrid=True,
+               gridcolor=GRID_CLR, color=TICK_CLR, title="Accuracy (%)"),
+    xaxis=dict(showgrid=False, color=TICK_CLR, tickangle=-25,
+               tickfont=dict(size=10, color='#1e3a5f')),
+    legend=dict(font_color='#334155', bgcolor='rgba(255,255,255,0.8)',
+                orientation='h', y=1.12),
+    margin=dict(l=10, r=10, t=60, b=90))
+st.plotly_chart(fig_per, use_container_width=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# Head-to-head bar charts
+st.markdown('<div class="sec-hdr">📊 Head-to-Head Charts</div>',
             unsafe_allow_html=True)
 cc1, cc2 = st.columns(2)
 
 with cc1:
     fig_cmp = go.Figure()
     for mname, clr, val in [
-        ("Random Forest", "#7c3aed", rf_res.get('Acc', 0)),
-        ("XGBoost",       "#0891b2", xgb_res.get('Acc', 0))
+        ("Random Forest","#7c3aed", rf_res.get('Acc',0)),
+        ("XGBoost",      "#0891b2", xgb_res.get('Acc',0))
     ]:
         fig_cmp.add_trace(go.Bar(
             name=mname, x=['Accuracy (%)'], y=[val],
@@ -672,19 +786,21 @@ with cc1:
     fig_cmp.update_layout(
         paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
         font_color=FONT_CLR, height=280, barmode='group',
-        title=dict(text="Accuracy (%)", font_color='#1e3a5f', font_size=13),
+        title=dict(text="Accuracy Comparison (%)",
+                   font_color='#1e3a5f', font_size=13),
         yaxis=dict(range=[0,100], showgrid=True,
                    gridcolor=GRID_CLR, color=TICK_CLR),
         xaxis=dict(showgrid=False, color=TICK_CLR),
-        legend=dict(font_color='#334155', bgcolor='rgba(255,255,255,0.8)'),
+        legend=dict(font_color='#334155',
+                    bgcolor='rgba(255,255,255,0.8)'),
         margin=dict(l=0, r=0, t=40, b=10))
     st.plotly_chart(fig_cmp, use_container_width=True)
 
 with cc2:
     fig_mae = go.Figure()
     for mname, clr, val in [
-        ("Random Forest", "#7c3aed", rf_res.get('MAE', 0)),
-        ("XGBoost",       "#0891b2", xgb_res.get('MAE', 0))
+        ("Random Forest","#7c3aed", rf_res.get('MAE',0)),
+        ("XGBoost",      "#0891b2", xgb_res.get('MAE',0))
     ]:
         fig_mae.add_trace(go.Bar(
             name=mname, x=['MAE (PKR)'], y=[val],
@@ -698,7 +814,8 @@ with cc2:
                    font_color='#1e3a5f', font_size=13),
         yaxis=dict(showgrid=True, gridcolor=GRID_CLR, color=TICK_CLR),
         xaxis=dict(showgrid=False, color=TICK_CLR),
-        legend=dict(font_color='#334155', bgcolor='rgba(255,255,255,0.8)'),
+        legend=dict(font_color='#334155',
+                    bgcolor='rgba(255,255,255,0.8)'),
         margin=dict(l=0, r=0, t=40, b=10))
     st.plotly_chart(fig_mae, use_container_width=True)
 
